@@ -10,6 +10,7 @@ import {
   currentSourcesMatch,
   extractUnifiedDiff,
   removeWorktree,
+  runChecks,
 } from "./git.js";
 
 async function makeRepo(root: string): Promise<void> {
@@ -17,15 +18,15 @@ async function makeRepo(root: string): Promise<void> {
   await writeFile(join(root, "src", "value.ts"), "export const value = 1;\n");
   await writeFile(join(root, "src", "untouched.ts"), "export const untouched = true;\n");
   execFileSync("git", ["init", "-b", "main"], { cwd: root, stdio: "ignore" });
-  execFileSync("git", ["config", "user.name", "Muse Bridge Tests"], { cwd: root });
-  execFileSync("git", ["config", "user.email", "muse-bridge-tests@example.invalid"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Instinct Bridge Tests"], { cwd: root });
+  execFileSync("git", ["config", "user.email", "instinct-bridge-tests@example.invalid"], { cwd: root });
   execFileSync("git", ["add", "."], { cwd: root });
   execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
 }
 
 test("snapshot overlays only selected current files onto the committed checkout", async () => {
-  const root = await mkdtemp(join(tmpdir(), "muse-bridge-git-"));
-  const checkoutCache = await mkdtemp(join(tmpdir(), "muse-bridge-worktrees-"));
+  const root = await mkdtemp(join(tmpdir(), "instinct-bridge-git-"));
+  const checkoutCache = await mkdtemp(join(tmpdir(), "instinct-bridge-worktrees-"));
   await makeRepo(root);
   try {
     await writeFile(join(root, "src", "value.ts"), "export const value = 2;\n");
@@ -53,8 +54,8 @@ test("snapshot overlays only selected current files onto the committed checkout"
 });
 
 test("selected secrets, ignored files, and out-of-scope diffs are rejected", async () => {
-  const root = await mkdtemp(join(tmpdir(), "muse-bridge-security-"));
-  const checkoutCache = await mkdtemp(join(tmpdir(), "muse-bridge-worktrees-"));
+  const root = await mkdtemp(join(tmpdir(), "instinct-bridge-security-"));
+  const checkoutCache = await mkdtemp(join(tmpdir(), "instinct-bridge-worktrees-"));
   await makeRepo(root);
   try {
     await writeFile(join(root, ".env"), "DEMO=value\n");
@@ -82,6 +83,14 @@ test("selected secrets, ignored files, and out-of-scope diffs are rejected", asy
       "diff --git a/other.ts b/other.ts\n--- a/other.ts\n+++ b/other.ts\n@@ -1 +1 @@\n-old\n+new",
       ["src/value.ts"],
     ), /not selected/);
+    assert.throws(() => extractUnifiedDiff(
+      "--- a/src/value.ts\n+++ b/src/value.ts\n@@ -1 +1 @@\n-old\n+new\n-extra\n+ignored",
+      ["src/value.ts"],
+    ), /outside a declared hunk/);
+    assert.throws(() => extractUnifiedDiff(
+      "--- a/src/value.ts\n+++ b/src/value.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n--- a/src/other.ts\n+++ b/src/other.ts\n@@ -1 +1 @@\n-before\n+after",
+      ["src/value.ts", "src/other.ts"],
+    ), /next file before its declared line counts/);
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(checkoutCache, { recursive: true, force: true });
@@ -89,8 +98,8 @@ test("selected secrets, ignored files, and out-of-scope diffs are rejected", asy
 });
 
 test("unified diff is checked and applied only in the temporary worktree", async () => {
-  const root = await mkdtemp(join(tmpdir(), "muse-bridge-patch-"));
-  const checkoutCache = await mkdtemp(join(tmpdir(), "muse-bridge-worktrees-"));
+  const root = await mkdtemp(join(tmpdir(), "instinct-bridge-patch-"));
+  const checkoutCache = await mkdtemp(join(tmpdir(), "instinct-bridge-worktrees-"));
   await makeRepo(root);
   try {
     const job = await createJobSnapshot({
@@ -117,5 +126,20 @@ index 5dd9c48..c1b0730 100644
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(checkoutCache, { recursive: true, force: true });
+  }
+});
+
+test("checks can find Node from the bridge runtime when its PATH is minimal", async () => {
+  const originalPath = process.env.PATH;
+  try {
+    process.env.PATH = "/usr/bin:/bin";
+    const results = await runChecks(process.cwd(), [{
+      argv: ["node", "-e", "process.stdout.write('runtime-node-found')"],
+    }]);
+    assert.equal(results[0]?.exitCode, 0);
+    assert.equal(results[0]?.output, "runtime-node-found");
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
   }
 });

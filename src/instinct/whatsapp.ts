@@ -11,18 +11,20 @@ import makeWASocket, {
 } from "baileys";
 import pino from "pino";
 import { config } from "../config.js";
+const MARKER_PREFIX = "BRIDGE";
 
-export type MuseResponse =
+export type InstinctResponse =
   | { kind: "patch"; response: string }
   | { kind: "quota_exhausted"; message: string }
   | { kind: "cannot_complete"; message: string };
 
 export type WhatsAppFailureCode =
   | "login_required"
-  | "target_missing"
   | "connection_timeout"
   | "linked_device_replaced"
   | "delivery_uncertain"
+  | "reply_timeout"
+  | "chat_not_selected"
   | "cancelled";
 
 export class WhatsAppBridgeError extends Error {
@@ -33,10 +35,10 @@ export class WhatsAppBridgeError extends Error {
 }
 
 function marker(jobId: string, state: "BEGIN" | "DONE" | "ERROR"): string {
-  return `MUSE_BRIDGE_${state}_${jobId.replaceAll("-", "").toUpperCase()}`;
+  return `${MARKER_PREFIX}_${state}_${jobId.replaceAll("-", "").toUpperCase()}`;
 }
 
-export function buildMusePrompt(
+export function buildInstinctPrompt(
   jobId: string,
   task: string,
   paths: string[],
@@ -61,27 +63,27 @@ export function buildMusePrompt(
   ].join("\n\n");
 }
 
-export function parseMuseResponse(jobId: string, text: string): MuseResponse {
+export function parseInstinctResponse(jobId: string, text: string): InstinctResponse {
   const errorMarker = marker(jobId, "ERROR");
   const errorAt = text.indexOf(errorMarker);
   if (errorAt >= 0) {
     const message = text.slice(errorAt + errorMarker.length).replace(/^\s*:?\s*/, "").trim().slice(0, 1_000);
     return /\b(?:quota|usage)\b.{0,40}\b(?:exhausted|limit|reached)\b|\bquota_exhausted\b/i.test(message)
-      ? { kind: "quota_exhausted", message: message || "Muse reports that the account usage limit has been reached." }
-      : { kind: "cannot_complete", message: message || "Muse could not complete this task." };
+      ? { kind: "quota_exhausted", message: message || "The account usage limit has been reached." }
+      : { kind: "cannot_complete", message: message || "The task could not be completed." };
   }
   const begin = marker(jobId, "BEGIN");
   const end = marker(jobId, "DONE");
   const beginAt = text.indexOf(begin);
   const endAt = text.indexOf(end, beginAt + begin.length);
   if (beginAt < 0 || endAt < 0) {
-    throw new Error("Muse's WhatsApp reply did not include the expected job markers.");
+    throw new Error("The WhatsApp reply did not include the expected job markers.");
   }
   return { kind: "patch", response: text.slice(beginAt + begin.length, endAt).trim() };
 }
 
 function extractMessageText(message: WAMessage): string | null {
-  const content = normalizeMessageContent(message.message);
+  const content = normalizeMessageContent(message.message?.protocolMessage?.editedMessage ?? message.message);
   if (!content) return null;
   const text = content.conversation
     ?? content.extendedTextMessage?.text
@@ -92,7 +94,11 @@ function extractMessageText(message: WAMessage): string | null {
 }
 
 export function isDirectJid(jid: string | null | undefined): jid is string {
-  return Boolean(jid && (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid") || jid.endsWith("@bot")));
+  return Boolean(jid && (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid")));
+}
+
+export function shouldIgnoreWhatsAppJid(jid: string): boolean {
+  return !isDirectJid(jid);
 }
 
 export function isIncomingDirectChat(jid: string | null | undefined, fromMe: boolean | null | undefined): jid is string {
@@ -109,10 +115,45 @@ export function hasLinkedWhatsAppIdentity(credentials: { me?: { id?: unknown } |
 }
 
 export function findCorrelatedJobId(text: string, jobIds: Iterable<string>): string | null {
-  for (const jobId of jobIds) {
-    if (text.includes(marker(jobId, "BEGIN")) || text.includes(marker(jobId, "ERROR"))) return jobId;
+  const matches = [...jobIds].filter((jobId) => (
+    text.includes(marker(jobId, "BEGIN"))
+    || text.includes(marker(jobId, "DONE"))
+    || text.includes(marker(jobId, "ERROR"))
+  ));
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+export class CorrelatedReplyBuffer {
+  readonly #expectedJobs: Set<string>;
+  readonly #partial = new Map<string, string>();
+
+  constructor(expectedJobs: Set<string>) {
+    this.#expectedJobs = expectedJobs;
   }
-  return null;
+
+  get partialJobCount(): number {
+    return this.#partial.size;
+  }
+
+  hasPartial(jobId: string): boolean {
+    return this.#partial.has(jobId);
+  }
+
+  append(text: string): { jobId: string; response: string } | null {
+    const markedJobId = findCorrelatedJobId(text, this.#expectedJobs);
+    const jobId = markedJobId ?? (this.#partial.size === 1 ? this.#partial.keys().next().value as string : null);
+    if (!jobId) return null;
+
+    const response = (this.#partial.get(jobId) ?? "") + text;
+    const done = response.includes(marker(jobId, "DONE"));
+    const failed = response.includes(marker(jobId, "ERROR"));
+    if (done || failed) {
+      this.#partial.delete(jobId);
+      return { jobId, response };
+    }
+    this.#partial.set(jobId, response);
+    return null;
+  }
 }
 
 function disconnectCode(error: unknown): number | null {
@@ -138,11 +179,19 @@ async function secureDirectory(directory: string, scanContents = true): Promise<
 }
 
 export interface WhatsAppSessionOptions {
-  targetJid?: string;
+  chatJid?: string;
   allowUnregistered?: boolean;
   expectedJobIds?: string[];
   onQr?: (qr: string) => void;
-  onMessageMetadata?: (event: { type: string; domain: string | null; fromMe: boolean | null | undefined; hasMessage: boolean }) => void;
+  onMessageMetadata?: (event: {
+    type: string;
+    domain: string | null;
+    fromMe: boolean | null | undefined;
+    hasMessage: boolean;
+    chatMatched: boolean | null;
+    jobMatched: boolean;
+  }) => void;
+  onConnectionMetadata?: (event: { state: string | null; closeCode: number | null; hasQr: boolean }) => void;
 }
 
 interface ReplyWaiter {
@@ -151,15 +200,16 @@ interface ReplyWaiter {
   cleanup: () => void;
 }
 
-export class MuseWhatsAppSession {
+export class InstinctWhatsAppSession {
   readonly #events = new EventEmitter();
   readonly #expectedJobs: Set<string>;
+  readonly #replyBuffer: CorrelatedReplyBuffer;
   readonly #receivedResponses = new Map<string, string>();
   readonly #waiters = new Map<string, ReplyWaiter>();
   readonly #authState: Awaited<ReturnType<typeof useMultiFileAuthState>>["state"];
   readonly #saveCreds: () => Promise<void>;
   readonly #options: WhatsAppSessionOptions;
-  readonly #targetJid: string | null;
+  readonly #chatJid: string | null;
   #socket: WASocket | null = null;
   #socketGeneration = 0;
   #connected = false;
@@ -178,11 +228,12 @@ export class MuseWhatsAppSession {
     this.#authState = authState;
     this.#saveCreds = saveCreds;
     this.#options = options;
-    this.#targetJid = options.targetJid ?? null;
+    this.#chatJid = options.chatJid ?? null;
     this.#expectedJobs = new Set(options.expectedJobIds ?? []);
+    this.#replyBuffer = new CorrelatedReplyBuffer(this.#expectedJobs);
   }
 
-  static async open(options: WhatsAppSessionOptions = {}): Promise<MuseWhatsAppSession> {
+  static async open(options: WhatsAppSessionOptions = {}): Promise<InstinctWhatsAppSession> {
     process.umask(0o077);
     await secureDirectory(config.whatsappAuthDir);
     const auth = await useMultiFileAuthState(config.whatsappAuthDir);
@@ -190,9 +241,9 @@ export class MuseWhatsAppSession {
     // Baileys may leave `registered` false for a linked companion QR session.
     // `me.id` is set when that companion identity is saved.
     if (!options.allowUnregistered && !hasLinkedWhatsAppIdentity(auth.state.creds)) {
-      throw new WhatsAppBridgeError("login_required", "Pair WhatsApp with `npm run whatsapp-setup` before submitting a Muse job.");
+      throw new WhatsAppBridgeError("login_required", "Pair WhatsApp with `npm run whatsapp-setup` before submitting a task.");
     }
-    const session = new MuseWhatsAppSession(auth.state, auth.saveCreds, options);
+    const session = new InstinctWhatsAppSession(auth.state, auth.saveCreds, options);
     session.#startSocket();
     return session;
   }
@@ -221,8 +272,8 @@ export class MuseWhatsAppSession {
   }
 
   waitForChatCandidate(timeoutMs: number): Promise<WhatsAppChatCandidate> {
-    if (this.#targetJid || this.#awaitingCandidate) {
-      return Promise.reject(new Error("Chat selection is already active or this session has a bound target."));
+    if (this.#chatJid || this.#awaitingCandidate) {
+      return Promise.reject(new Error("Chat selection is already active or a chat is already bound."));
     }
     if (this.#fatalError) return Promise.reject(this.#fatalError);
     this.#awaitingCandidate = true;
@@ -230,7 +281,7 @@ export class MuseWhatsAppSession {
       const onCandidate = (candidate: WhatsAppChatCandidate) => finish(() => resolve(candidate));
       const onFatal = (error: WhatsAppBridgeError) => finish(() => reject(error));
       const timer = setTimeout(() => finish(() => reject(new WhatsAppBridgeError(
-        "target_missing",
+        "chat_not_selected",
         "No direct chat replied while setup was waiting. Send a short message to the intended chat and wait for its reply.",
       ))), timeoutMs);
       const finish = (action: () => void) => {
@@ -249,7 +300,7 @@ export class MuseWhatsAppSession {
     const existing = this.#receivedResponses.get(jobId);
     if (existing) return Promise.resolve(existing);
     const active = this.#waiters.get(jobId);
-    if (active) return Promise.reject(new Error(`Already waiting for a Muse reply for job ${jobId}.`));
+    if (active) return Promise.reject(new Error(`Already waiting for a reply for job ${jobId}.`));
     this.#expectedJobs.add(jobId);
     return new Promise<string>((resolve, reject) => {
       const finish = (action: () => void) => {
@@ -258,8 +309,10 @@ export class MuseWhatsAppSession {
         action();
       };
       const timer = setTimeout(() => finish(() => reject(new WhatsAppBridgeError(
-        "delivery_uncertain",
-        "Muse did not return a correlated reply before the timeout. The request was not resent.",
+        "reply_timeout",
+        this.#replyBuffer.hasPartial(jobId)
+          ? "The reply began but did not include its completion marker before the timeout. The request was sent and was not resent."
+          : "No correlated reply arrived before the timeout. The request was sent and was not resent.",
       ))), timeoutMs);
       const cancelPoll = setInterval(() => {
         if (shouldCancel()) finish(() => reject(new WhatsAppBridgeError("cancelled", "The job was cancelled locally.")));
@@ -279,14 +332,14 @@ export class MuseWhatsAppSession {
   }
 
   async sendText(text: string): Promise<void> {
-    if (!this.#targetJid) throw new WhatsAppBridgeError("target_missing", "The Muse WhatsApp chat has not been selected.");
+    if (!this.#chatJid) throw new WhatsAppBridgeError("chat_not_selected", "The Instinct WhatsApp chat has not been selected.");
     if (text.length > config.maxWhatsAppMessageCharacters) {
-      throw new Error(`Muse request is ${text.length} characters; the WhatsApp limit for this bridge is ${config.maxWhatsAppMessageCharacters}. Select fewer or smaller source files.`);
+      throw new Error(`Request is ${text.length} characters; the WhatsApp limit for this bridge is ${config.maxWhatsAppMessageCharacters}. Select fewer or smaller source files.`);
     }
     await this.waitUntilConnected();
     const socket = this.#socket;
     if (!socket) throw new WhatsAppBridgeError("connection_timeout", "WhatsApp is not connected.");
-    await socket.sendMessage(this.#targetJid, { text });
+    await socket.sendMessage(this.#chatJid, { text });
   }
 
   async close(): Promise<void> {
@@ -317,10 +370,7 @@ export class MuseWhatsAppSession {
       emitOwnEvents: true,
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      shouldIgnoreJid: (jid) => {
-        if (jid === "status@broadcast" || jid.endsWith("@g.us") || jid.endsWith("@broadcast")) return true;
-        return this.#targetJid ? jid !== this.#targetJid : false;
-      },
+      shouldIgnoreJid: shouldIgnoreWhatsAppJid,
       generateHighQualityLinkPreview: false,
     });
     this.#socket = socket;
@@ -335,17 +385,16 @@ export class MuseWhatsAppSession {
     socket.ev.on("messages.upsert", (upsert) => {
       if (generation !== this.#socketGeneration) return;
       for (const message of upsert.messages) {
-        this.#options.onMessageMetadata?.({
-          type: upsert.type,
-          domain: message.key.remoteJid?.split("@").at(-1) ?? null,
-          fromMe: message.key.fromMe,
-          hasMessage: Boolean(message.message),
-        });
-        this.#handleMessage(message);
+        this.#acceptMessage(message, upsert.type);
       }
     });
     socket.ev.on("connection.update", (update) => {
       if (generation !== this.#socketGeneration) return;
+      this.#options.onConnectionMetadata?.({
+        state: update.connection ?? null,
+        closeCode: update.connection === "close" ? disconnectCode(update.lastDisconnect?.error) : null,
+        hasQr: Boolean(update.qr),
+      });
       if (update.qr) this.#options.onQr?.(update.qr);
       if (update.connection === "open") {
         this.#connected = true;
@@ -382,25 +431,58 @@ export class MuseWhatsAppSession {
     for (const waiter of this.#waiters.values()) waiter.reject(error);
   }
 
+  #acceptMessage(message: WAMessage, type: string): void {
+    const chatMatched = this.#chatJid
+      ? isBoundChatJid(message.key.remoteJid, this.#chatJid, message.key.remoteJidAlt)
+      : null;
+    const text = chatMatched ? extractMessageText(message) : null;
+    this.#options.onMessageMetadata?.({
+      type,
+      domain: message.key.remoteJid?.split("@").at(-1) ?? null,
+      fromMe: message.key.fromMe,
+      hasMessage: Boolean(message.message),
+      chatMatched,
+      jobMatched: Boolean(text && findCorrelatedJobId(text, this.#expectedJobs)),
+    });
+    this.#handleMessage(message);
+  }
+
   #handleMessage(message: WAMessage): void {
     const jid = message.key.remoteJid;
-    if (this.#awaitingCandidate && !this.#targetJid && isIncomingDirectChat(jid, message.key.fromMe) && extractMessageText(message)) {
+    if (this.#awaitingCandidate && !this.#chatJid && isIncomingDirectChat(jid, message.key.fromMe) && extractMessageText(message)) {
       const name = typeof message.pushName === "string" ? message.pushName.replace(/[\x00-\x1f\x7f]/g, "").trim() : "";
       this.#events.emit("chat_candidate", { jid, name: name || null } satisfies WhatsAppChatCandidate);
       return;
     }
-    if (!isDirectJid(jid) || message.key.fromMe || jid !== this.#targetJid) return;
+    if (!isDirectJid(jid) || message.key.fromMe || !this.#chatJid
+      || !isBoundChatJid(jid, this.#chatJid, message.key.remoteJidAlt)) return;
     const text = extractMessageText(message);
     if (!text) return;
-    const jobId = findCorrelatedJobId(text, this.#expectedJobs);
-    if (!jobId || this.#receivedResponses.has(jobId)) return;
-    this.#receivedResponses.set(jobId, text);
-    this.#waiters.get(jobId)?.resolve(text);
+    const completed = this.#replyBuffer.append(text);
+    if (!completed || this.#receivedResponses.has(completed.jobId)) return;
+    this.#receivedResponses.set(completed.jobId, completed.response);
+    this.#waiters.get(completed.jobId)?.resolve(completed.response);
   }
 }
 
-export async function saveMuseChatJid(jid: string): Promise<void> {
-  if (!isDirectJid(jid)) throw new Error("Only a direct Muse WhatsApp conversation can be bound.");
+function normalizeJid(jid: string): string {
+  return jid.replace(/:\d+(?=@)/, "");
+}
+
+export function isBoundChatJid(
+  remoteJid: string | null | undefined,
+  chatJid: string,
+  alternateJid?: string | null,
+): boolean {
+  const chat = normalizeJid(chatJid);
+  return Boolean(
+    (remoteJid && normalizeJid(remoteJid) === chat)
+    || (alternateJid && normalizeJid(alternateJid) === chat),
+  );
+}
+
+export async function saveInstinctChatJid(jid: string): Promise<void> {
+  if (!isDirectJid(jid)) throw new Error("Only a direct WhatsApp conversation can be bound.");
   await secureDirectory(dirname(config.whatsappTargetPath), false);
   const temporary = `${config.whatsappTargetPath}.${process.pid}.tmp`;
   await writeFile(temporary, JSON.stringify({ jid, updatedAt: new Date().toISOString() }), { mode: 0o600 });
@@ -408,7 +490,7 @@ export async function saveMuseChatJid(jid: string): Promise<void> {
   await rename(temporary, config.whatsappTargetPath);
 }
 
-export async function readMuseChatJid(): Promise<string | null> {
+export async function readInstinctChatJid(): Promise<string | null> {
   try {
     await chmod(config.whatsappTargetPath, 0o600);
     const raw = await readFile(config.whatsappTargetPath, "utf8");
@@ -421,8 +503,7 @@ export async function readMuseChatJid(): Promise<string | null> {
 }
 
 export async function isWhatsAppSetupReady(): Promise<boolean> {
-  const target = await readMuseChatJid();
-  if (!target) return false;
+  if (!await readInstinctChatJid()) return false;
   try {
     const raw = await readFile(join(config.whatsappAuthDir, "creds.json"), "utf8");
     const credentials = JSON.parse(raw) as { me?: { id?: unknown } | null };

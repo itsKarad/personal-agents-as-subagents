@@ -1,5 +1,5 @@
 {
-  "name": "personal-muse-bridge",
+  "name": "personal-instinct-bridge",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test src/*.test.ts src/muse/*.test.ts",
+    "test": "tsx --test src/*.test.ts src/instinct/*.test.ts",
     "mcp": "node dist/src/mcp.js",
     "whatsapp-setup": "node --import tsx scripts/whatsapp-setup.ts",
     "install-local": "npm run build && node dist/src/install.js"

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { applyPatchInWorktree, createJobSnapshot, extractUnifiedDiff, readSelectedSources, removeWorktree, runChecks } from "./git.js";
-import { buildMusePrompt, parseMuseResponse } from "./muse/whatsapp.js";
+import { buildInstinctPrompt, parseInstinctResponse } from "./instinct/whatsapp.js";
 import { JobStore } from "./store.js";
 
 interface FixtureTask {
@@ -51,7 +51,7 @@ const tasks: FixtureTask[] = [
 function fixtureReply(jobId: string, task: FixtureTask): string {
   const id = jobId.replaceAll("-", "").toUpperCase();
   return [
-    `MUSE_BRIDGE_BEGIN_${id}`,
+    `BRIDGE_BEGIN_${id}`,
     "```diff",
     `diff --git a/${task.path} b/${task.path}`,
     `--- a/${task.path}`,
@@ -62,12 +62,12 @@ function fixtureReply(jobId: string, task: FixtureTask): string {
     `+${task.newLine}`,
     ` ${task.lastLine}`,
     "```",
-    `MUSE_BRIDGE_DONE_${id}`,
+    `BRIDGE_DONE_${id}`,
   ].join("\n");
 }
 
 test("three mechanical fixture delegations reach review with passing checks", async () => {
-  const root = await mkdtemp(join(tmpdir(), "muse-bridge-pilot-"));
+  const root = await mkdtemp(join(tmpdir(), "instinct-bridge-pilot-"));
   const checkoutCache = join(root, "worktrees");
   const fixtureRoot = join(process.cwd(), "fixtures");
   const store = new JobStore();
@@ -78,8 +78,8 @@ test("three mechanical fixture delegations reach review with passing checks", as
       const repo = join(root, fixture.name);
       await cp(join(fixtureRoot, fixture.name), repo, { recursive: true });
       execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
-      execFileSync("git", ["config", "user.name", "Muse Bridge Pilot"], { cwd: repo });
-      execFileSync("git", ["config", "user.email", "muse-bridge@example.invalid"], { cwd: repo });
+      execFileSync("git", ["config", "user.name", "Instinct Bridge Pilot"], { cwd: repo });
+      execFileSync("git", ["config", "user.email", "instinct-bridge@example.invalid"], { cwd: repo });
       execFileSync("git", ["add", "."], { cwd: repo });
       execFileSync("git", ["commit", "-m", "fixture"], { cwd: repo, stdio: "ignore" });
 
@@ -88,14 +88,14 @@ test("three mechanical fixture delegations reach review with passing checks", as
       snapshots.push({ repo, worktreePath: snapshot.worktreePath });
       store.createJob({ ...snapshot, id: jobId, task: fixture.task });
       assert.equal(store.setStatus(jobId, "preparing"), true);
-      assert.equal(store.setStatus(jobId, "awaiting_muse"), true);
+      assert.equal(store.setStatus(jobId, "awaiting_reply"), true);
 
       const sources = await readSelectedSources(snapshot.worktreePath, snapshot.paths);
-      const prompt = buildMusePrompt(jobId, fixture.task, snapshot.paths, sources);
+      const prompt = buildInstinctPrompt(jobId, fixture.task, snapshot.paths, sources);
       assert.match(prompt, new RegExp(fixture.path.replaceAll("/", "\\/")));
       assert.equal(sources.length, 1);
-      const simulatedMuseReply = fixtureReply(jobId, fixture);
-      const response = parseMuseResponse(jobId, simulatedMuseReply);
+      const simulatedInstinctReply = fixtureReply(jobId, fixture);
+      const response = parseInstinctResponse(jobId, simulatedInstinctReply);
       assert.equal(response.kind, "patch");
       if (response.kind !== "patch") throw new Error("Expected a patch response.");
       const patch = extractUnifiedDiff(response.response, [fixture.path]);

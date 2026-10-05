@@ -2,8 +2,8 @@ import type { CheckResult, Job, JobStatus, NewJob } from "./domain.js";
 
 const allowedTransitions: Record<JobStatus, ReadonlySet<JobStatus>> = {
   queued: new Set(["preparing", "cancelled"]),
-  preparing: new Set(["awaiting_muse", "needs_user_attention", "failed", "cancelled"]),
-  awaiting_muse: new Set(["checking", "needs_user_attention", "quota_exhausted", "failed", "cancelled"]),
+  preparing: new Set(["awaiting_reply", "needs_user_attention", "failed", "cancelled"]),
+  awaiting_reply: new Set(["checking", "needs_user_attention", "quota_exhausted", "failed", "cancelled"]),
   checking: new Set(["ready_for_review", "needs_user_attention", "failed", "cancelled"]),
   ready_for_review: new Set(),
   needs_user_attention: new Set(),
@@ -63,7 +63,7 @@ export class JobStore {
 
   setPatch(id: string, patch: string): boolean {
     const job = this.#jobs.get(id);
-    if (!job || job.status !== "awaiting_muse") return false;
+    if (!job || job.status !== "awaiting_reply") return false;
     job.patch = patch;
     job.status = "checking";
     job.updatedAt = new Date().toISOString();

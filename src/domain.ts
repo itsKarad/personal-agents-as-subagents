@@ -1,7 +1,7 @@
 export const JOB_STATUSES = [
   "queued",
   "preparing",
-  "awaiting_muse",
+  "awaiting_reply",
   "checking",
   "ready_for_review",
   "needs_user_attention",
@@ -11,7 +11,6 @@ export const JOB_STATUSES = [
 ] as const;
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
-
 export interface CheckCommand {
   argv: string[];
 }

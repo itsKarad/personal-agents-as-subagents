@@ -1,59 +1,23 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { config } from "./config.js";
 import type { Job } from "./domain.js";
 import { applyPatchInWorktree, extractUnifiedDiff, readSelectedSources, removeWorktree, runChecks } from "./git.js";
-import { buildMusePrompt, isWhatsAppSetupReady, MuseWhatsAppSession, parseMuseResponse, readMuseChatJid } from "./muse/whatsapp.js";
+import { buildInstinctPrompt, isWhatsAppSetupReady, InstinctWhatsAppSession, parseInstinctResponse, readInstinctChatJid, WhatsAppBridgeError } from "./instinct/whatsapp.js";
+import { acquireWhatsAppSessionLock } from "./session-lock.js";
 import { JobStore } from "./store.js";
 
-const lockPath = join(config.dataDir, "whatsapp-session.lock");
-
-function processIsAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+export function classifyRunnerError(error: unknown): {
+  code: string;
+  message: string;
+  status: "needs_user_attention" | "failed";
+} {
+  if (error instanceof WhatsAppBridgeError) {
+    return { code: error.code, message: error.message, status: "needs_user_attention" };
   }
-}
-
-async function acquireSession(shouldCancel: () => boolean): Promise<(() => Promise<void>) | null> {
-  await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  const token = randomUUID();
-  while (!shouldCancel()) {
-    try {
-      const handle = await open(lockPath, "wx", 0o600);
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, token }));
-      } finally {
-        await handle.close();
-      }
-      return async () => {
-        try {
-          const owner = JSON.parse(await readFile(lockPath, "utf8")) as { token?: string };
-          if (owner.token === token) await unlink(lockPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        const owner = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: number };
-        if (!processIsAlive(owner.pid ?? 0)) await unlink(lockPath);
-      } catch (readError) {
-        if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
-          const age = Date.now() - (await stat(lockPath)).mtimeMs;
-          if (age > 5_000) await unlink(lockPath).catch(() => undefined);
-        }
-      }
-      await delay(250);
-    }
-  }
-  return null;
+  return {
+    code: "job_failed",
+    message: error instanceof Error ? error.message : String(error),
+    status: "failed",
+  };
 }
 
 export class JobRunner {
@@ -61,14 +25,14 @@ export class JobRunner {
   readonly #queue: string[] = [];
   #running = false;
   #closed = false;
-  #activeSession: MuseWhatsAppSession | null = null;
+  #activeSession: InstinctWhatsAppSession | null = null;
 
   constructor(store: JobStore) {
     this.#store = store;
   }
 
   enqueue(job: Job): void {
-    if (this.#closed) throw new Error("Muse runner is closed.");
+    if (this.#closed) throw new Error("Instinct runner is closed.");
     this.#queue.push(job.id);
     void this.#drain();
   }
@@ -99,42 +63,52 @@ export class JobRunner {
 
   async #run(job: Job): Promise<void> {
     let release: (() => Promise<void>) | null = null;
-    let session: MuseWhatsAppSession | null = null;
+    let session: InstinctWhatsAppSession | null = null;
     const cancelled = () => this.#store.getJob(job.id)?.status === "cancelled";
     try {
       if (cancelled() || !this.#store.setStatus(job.id, "preparing")) return;
+      release = await acquireWhatsAppSessionLock(config.dataDir, cancelled);
+      if (!release || cancelled()) return;
       if (!await isWhatsAppSetupReady()) {
         this.#fail(job, "whatsapp_setup_required", "Run `npm run whatsapp-setup`, then submit the task again.");
         return;
       }
-      const targetJid = await readMuseChatJid();
-      if (!targetJid) {
-        this.#fail(job, "muse_chat_required", "Select the Muse WhatsApp chat with `npm run whatsapp-setup`.");
+      const chatJid = await readInstinctChatJid();
+      if (!chatJid) {
+        this.#fail(job, "instinct_chat_required", "Select the Instinct WhatsApp chat with `npm run whatsapp-setup`.");
         return;
       }
       const sources = await readSelectedSources(job.worktreePath, job.paths);
-      const prompt = buildMusePrompt(job.id, job.task, job.paths, sources);
+      const prompt = buildInstinctPrompt(job.id, job.task, job.paths, sources);
       if (prompt.length > config.maxWhatsAppMessageCharacters) {
         this.#fail(job, "request_too_large", "Select fewer or smaller source files for WhatsApp.");
         return;
       }
-      release = await acquireSession(cancelled);
-      if (!release || cancelled()) return;
-      session = await MuseWhatsAppSession.open({ targetJid, expectedJobIds: [job.id] });
+      session = await InstinctWhatsAppSession.open({
+        chatJid,
+        expectedJobIds: [job.id],
+        ...(process.env.INSTINCT_BRIDGE_DEBUG === "1" ? {
+          onMessageMetadata: (event) => process.stderr.write(`INSTINCT_METADATA ${JSON.stringify(event)}\n`),
+          onConnectionMetadata: (event) => process.stderr.write(`INSTINCT_CONNECTION_METADATA ${JSON.stringify(event)}\n`),
+        } : {}),
+      });
       this.#activeSession = session;
       await session.waitUntilConnected();
-      if (cancelled() || !this.#store.setStatus(job.id, "awaiting_muse")) return;
+      if (cancelled() || !this.#store.setStatus(job.id, "awaiting_reply")) return;
+      if (process.env.INSTINCT_BRIDGE_DEBUG === "1") {
+        process.stderr.write(`INSTINCT_SEND_METADATA ${JSON.stringify({ selectedPathCount: job.paths.length, promptCharacters: prompt.length })}\n`);
+      }
       try {
         await session.sendText(prompt);
       } catch (error) {
         this.#fail(job, "delivery_uncertain", `WhatsApp did not confirm delivery. The request was not resent. ${error instanceof Error ? error.message : String(error)}`);
         return;
       }
-      const reply = await session.waitForJobReply(job.id, config.museResponseTimeoutMs, cancelled);
+      const reply = await session.waitForJobReply(job.id, config.assistantResponseTimeoutMs, cancelled);
       if (cancelled()) return;
       let response;
       try {
-        response = parseMuseResponse(job.id, reply);
+        response = parseInstinctResponse(job.id, reply);
       } catch (error) {
         this.#fail(job, "invalid_reply", error instanceof Error ? error.message : String(error));
         return;
@@ -144,7 +118,7 @@ export class JobRunner {
         return;
       }
       if (response.kind === "cannot_complete") {
-        this.#fail(job, "muse_could_not_complete", response.message);
+        this.#fail(job, "instinct_could_not_complete", response.message);
         return;
       }
       try {
@@ -158,7 +132,10 @@ export class JobRunner {
       const checks = await runChecks(job.worktreePath, job.checks, cancelled);
       if (!cancelled()) this.#store.setCheckResults(job.id, checks);
     } catch (error) {
-      if (!cancelled()) this.#fail(job, "job_failed", error instanceof Error ? error.message : String(error), "failed");
+      if (!cancelled()) {
+        const failure = classifyRunnerError(error);
+        this.#fail(job, failure.code, failure.message, failure.status);
+      }
     } finally {
       await session?.close();
       if (this.#activeSession === session) this.#activeSession = null;

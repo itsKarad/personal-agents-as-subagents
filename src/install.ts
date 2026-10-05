@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const name = "muse-patch-bridge";
+const name = "instinct-patch-bridge";
 
 async function run(args: string[]): Promise<string> {
   const result = await execFileAsync("codex", ["mcp", ...args], { encoding: "utf8" });
@@ -33,6 +33,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`Muse bridge install failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(`Instinct bridge install failed: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
 });

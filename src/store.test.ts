@@ -18,7 +18,7 @@ test("jobs and reviews stay in the current MCP process", () => {
   const store = new JobStore();
   addJob(store, "job-1");
   assert.equal(store.setStatus("job-1", "preparing"), true);
-  assert.equal(store.setStatus("job-1", "awaiting_muse"), true);
+  assert.equal(store.setStatus("job-1", "awaiting_reply"), true);
   assert.equal(store.setPatch("job-1", "--- a/src/value.ts\n+++ b/src/value.ts\n"), true);
   assert.equal(store.setCheckResults("job-1", []), true);
   store.recordReview("job-1", true, null);
@@ -31,7 +31,7 @@ test("cancelled jobs reject late patches and results", () => {
   const store = new JobStore();
   addJob(store, "job-2");
   store.setStatus("job-2", "preparing");
-  store.setStatus("job-2", "awaiting_muse");
+  store.setStatus("job-2", "awaiting_reply");
   store.cancelJob("job-2");
   assert.equal(store.setPatch("job-2", "late patch"), false);
   assert.equal(store.setStatus("job-2", "checking"), false);

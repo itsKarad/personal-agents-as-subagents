@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { config } from "./config.js";
@@ -219,7 +219,7 @@ export function extractUnifiedDiff(response: string, allowedPaths: string[]): st
   const fence = response.match(/```diff\s*([\s\S]*?)```/i);
   const patch = (fence?.[1] ?? response).trim();
   if (!patch || patch.includes("GIT binary patch") || /^Binary files /m.test(patch)) {
-    throw new InputError("Muse did not return a text unified diff.", "invalid_patch");
+    throw new InputError("Instinct did not return a text unified diff.", "invalid_patch");
   }
   if (/^(?:rename from|rename to|deleted file mode) /m.test(patch)) {
     throw new InputError("Renames and file deletions are not accepted.", "invalid_patch");
@@ -239,7 +239,42 @@ export function extractUnifiedDiff(response: string, allowedPaths: string[]): st
   if (!/^diff --git /m.test(patch) && !/^--- /m.test(patch)) {
     throw new InputError("The response does not look like a unified diff.", "invalid_patch");
   }
+  validateHunks(patch);
   return `${patch}\n`;
+}
+
+function validateHunks(patch: string): void {
+  const lines = patch.split("\n");
+  let hunkCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(line);
+    if (header) {
+      hunkCount++;
+      let oldRemaining = header[2] === undefined ? 1 : Number(header[2]);
+      let newRemaining = header[4] === undefined ? 1 : Number(header[4]);
+      while (oldRemaining > 0 || newRemaining > 0) {
+        const body = lines[++i];
+        if (body === undefined) throw new InputError("Patch hunk ends before its declared line counts.", "invalid_patch");
+        if (/^--- (?:a\/|\/dev\/null)/.test(body)
+          && /^\+\+\+ (?:b\/|\/dev\/null)/.test(lines[i + 1] ?? "")
+          && /^@@ /.test(lines[i + 2] ?? "")) {
+          throw new InputError("Patch hunk reaches the next file before its declared line counts.", "invalid_patch");
+        }
+        if (body.startsWith(" ")) { oldRemaining--; newRemaining--; }
+        else if (body.startsWith("-")) oldRemaining--;
+        else if (body.startsWith("+")) newRemaining--;
+        else if (body === "\\ No newline at end of file") continue;
+        else throw new InputError("Patch hunk contains an invalid line.", "invalid_patch");
+        if (oldRemaining < 0 || newRemaining < 0) throw new InputError("Patch hunk exceeds its declared line counts.", "invalid_patch");
+      }
+      if (lines[i + 1] === "\\ No newline at end of file") i++;
+      continue;
+    }
+    if (/^(?:diff --git |index |new file mode |--- |\+\+\+ )/.test(line) || line === "") continue;
+    throw new InputError("Patch contains text outside a declared hunk.", "invalid_patch");
+  }
+  if (hunkCount === 0) throw new InputError("Patch contains no change hunks.", "invalid_patch");
 }
 
 export async function applyPatchInWorktree(worktreePath: string, patch: string): Promise<void> {
@@ -279,6 +314,10 @@ export async function runChecks(
   shouldCancel: () => boolean = () => false,
 ): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
+  const checkPath = [...new Set([
+    dirname(process.execPath),
+    ...(process.env.PATH ?? "").split(delimiter).filter(Boolean),
+  ])].join(delimiter);
   for (const check of checks) {
     if (shouldCancel()) break;
     const startedAt = Date.now();
@@ -286,7 +325,7 @@ export async function runChecks(
       const child = spawn(check.argv[0]!, check.argv.slice(1), {
         cwd: worktreePath,
         shell: false,
-        env: { ...process.env, CI: "1" },
+        env: { ...process.env, PATH: checkPath, CI: "1" },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";

@@ -10,11 +10,11 @@ import { JobStore } from "./store.js";
 
 const instructions = [
   "Delegate only small, mechanical, bounded coding edits that are easy to review.",
-  "The bridge sends only selected source files to Muse through the user's linked WhatsApp chat. Select exact non-secret files; it rejects common secret paths and secret-like values.",
+  "The bridge sends only selected source files to the linked Instinct WhatsApp chat. Select exact non-secret files; it rejects common secret paths and secret-like values.",
   "Use deterministic, safe check commands. Checks run with shell=false in a temporary worktree.",
   "The bridge never edits the user's working tree. Fetch the result with get_job, inspect the unified diff and checks, and apply it yourself only when sourceFilesUnchanged is true.",
-  "Review Muse's work as lower-confidence output. Record accept/reject and the exact Codex token count when known; use null when unavailable.",
-  "Jobs exist only while this MCP process is running. If Muse needs login, delivery is uncertain, or quota is exhausted, take the work back directly. Never retry an uncertain request blindly.",
+  "Review Instinct's work before applying it. Record accept/reject and the exact review token count when known; use null when unavailable.",
+  "Jobs exist only while this MCP process is running. If Instinct needs login, delivery is uncertain, or quota is exhausted, take the work back directly. Never retry an uncertain request blindly.",
 ].join(" ");
 
 function result(value: unknown, isError = false) {
@@ -47,13 +47,13 @@ function summary(job: Job): Record<string, unknown> {
 const store = new JobStore();
 const runner = new JobRunner(store);
 const server = new McpServer(
-  { name: "muse-patch-bridge", version: "0.1.0" },
+  { name: "instinct-patch-bridge", version: "0.1.0" },
   { instructions, capabilities: { tools: {} } },
 );
 
 server.registerTool("delegate_patch", {
-  title: "Delegate a small patch to Muse",
-  description: "Queue a bounded patch request. Only selected text files are copied into a temporary checkout and sent to Muse in the bound WhatsApp conversation. The patch is never applied to the user's working tree.",
+  title: "Delegate a small patch to Instinct",
+  description: "Queue a bounded patch request. Only selected text files are copied into a temporary checkout and sent to Instinct in the bound WhatsApp conversation. The patch is never applied to the user's working tree.",
   inputSchema: {
     repo: z.string().min(1).refine(isAbsolute, "repo must be an absolute path").describe("Absolute path to the root of a Git repository with an initial commit."),
     task: z.string().min(1).max(config.maxTaskCharacters),
@@ -74,7 +74,7 @@ server.registerTool("delegate_patch", {
 });
 
 server.registerTool("get_job", {
-  title: "Get Muse patch job",
+  title: "Get Instinct patch job",
   description: "Get the current job status, diff, check results, and whether selected source files in the working tree still match the submitted snapshot.",
   inputSchema: { job_id: z.string().min(1) },
 }, async ({ job_id }) => {
@@ -90,14 +90,14 @@ server.registerTool("get_job", {
 });
 
 server.registerTool("list_jobs", {
-  title: "List Muse patch jobs",
-  description: "List recent Muse bridge jobs without returning source diffs.",
+  title: "List Instinct patch jobs",
+  description: "List recent Instinct bridge jobs without returning source diffs.",
   inputSchema: { limit: z.number().int().min(1).max(100).default(25) },
 }, async ({ limit }) => result({ jobs: store.listJobs(limit).map(summary) }));
 
 server.registerTool("cancel_job", {
-  title: "Cancel Muse patch job",
-  description: "Cancel a queued or running Muse job. A request already sent to Muse may continue there, but it will not be resent or applied locally.",
+  title: "Cancel Instinct patch job",
+  description: "Cancel a queued or running Instinct job. A request already sent to Instinct may continue there, but it will not be resent or applied locally.",
   inputSchema: { job_id: z.string().min(1) },
 }, async ({ job_id }) => {
   const job = store.cancelJob(job_id);

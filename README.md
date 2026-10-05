@@ -4,13 +4,9 @@ Codex can delegate small code edits to Instinct over WhatsApp. This local MCP br
 
 ## Architecture
 
-### Overview
+![Instinct patch bridge architecture overview](documentation/architecture-overview.png)
 
-[Editable Excalidraw diagram](documentation/architecture-overview.excalidraw)
-
-### Detailed flow
-
-[Editable Excalidraw diagram](documentation/architecture-detailed.excalidraw)
+[Editable Excalidraw source](documentation/architecture-overview.excalidraw)
 
 ## Setup
 
